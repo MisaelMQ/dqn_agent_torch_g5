@@ -1,112 +1,20 @@
 # DQN Reinforcement Learning (Stage ROS2)
 
-Paquete ROS 2 (`ament_python`) que implementa un agente de Deep Reinforcement Learning (DQN con PyTorch) para navegación móvil en el simulador **Stage ROS2**.  
-El agente aprende a navegar hacia objetivos evitando obstáculos utilizando información de LIDAR y odometría.
+Paquete ROS 2 (`ament_python`) que implementa un agente **Deep Q-Network (DQN)** en **PyTorch** para navegación autónoma en el simulador **Stage**.  
+El objetivo es aprender políticas de navegación basadas en **LiDAR + odometría**, con *reward shaping*, *curriculum learning* y manejo explícito de reinicios de odometría.
 
 ---
 
-## 1. Estructura del paquete
+## Requisitos
 
-La estructura del paquete sigue las convenciones estándar de ROS 2 para paquetes Python:
-
-dqn_stage_nav_torch/
-├── dqn_stage_nav_torch/
-│   ├── __init__.py
-│   ├── state_processor.py
-│   ├── torch_dqn_agent.py
-│   ├── train_node.py
-│   ├── eval_node.py
-│   └── odom_reset_wrapper.py
-├── launch/
-│   └── train.launch.py
-├── models/
-│   └── weights...
-├── test/
-│   ├── test_flake8.py
-│   ├── test_pep257.py
-│   └── test_copyright.py
-├── package.xml
-├── setup.py
-├── setup.cfg
-└── README.md
-
----
-
-## 2. Descripción de archivos principales
-
-### state_processor.py
-Encargado de transformar los datos crudos del LIDAR, la pose del robot y el objetivo en un **vector de estado normalizado** para el agente DQN.
-
-Funciones principales:
-- Binning del LIDAR
-- Normalización de distancias
-- Cálculo de información auxiliar (distancia al objetivo, error angular, velocidades previas)
-
----
-
-### torch_dqn_agent.py
-Implementa el núcleo del algoritmo de aprendizaje por refuerzo.
-
-Incluye:
-- Definición de la red Q (MLP o CNN 1D según número de bins)
-- Replay Buffer
-- Double DQN
-- Dueling DQN
-- Soft update del target network
-- Manejo de epsilon-greedy
-
-Clases principales:
-- TorchDQNConfig
-- QNetwork
-- ReplayBuffer
-- TorchDQNAgent
-
----
-
-### train_node.py
-Nodo ROS 2 que controla el **entrenamiento** del agente.
-
-Responsabilidades:
-- Recepción de LIDAR y odometría
-- Cálculo del estado
-- Selección y ejecución de acciones
-- Cálculo de recompensas
-- Detección de colisiones, éxito, timeout y estados de “stuck”
-- Manejo del currículum de objetivos
-- Guardado de modelos y métricas en CSV
-
-Este nodo es el corazón del sistema de entrenamiento.
-
----
-
-### eval_node.py
-Nodo ROS 2 utilizado para **evaluar** un modelo previamente entrenado.
-
-Características:
-- No entrena la red
-- No actualiza el replay buffer
-- Ejecuta la política aprendida
-- Permite observar el comportamiento del robot en el entorno
-
----
-
-### odom_reset_wrapper.py
-Nodo auxiliar que envuelve la odometría original de Stage para:
-
-- Re-centrar la posición (0,0,0) tras cada reset
-- Corregir offsets acumulados
-- Publicar una odometría consistente para el agente
-
-Es obligatorio tanto para entrenamiento como para evaluación.
-
----
-
-## 3. Dependencias principales
-
-- ROS 2 (Jazzy o compatible)
+### Software
+- Ubuntu 22.04 (recomendado)
+- ROS 2 Jazzy
+- Python ≥ 3.10
+- PyTorch (CPU o CUDA)
 - stage_ros2
-- PyTorch
-- NumPy
+
+### Paquetes ROS necesarios
 - rclpy
 - geometry_msgs
 - nav_msgs
@@ -115,87 +23,192 @@ Es obligatorio tanto para entrenamiento como para evaluación.
 
 ---
 
-## 4. Compilación del paquete
+## Entorno de simulación (OBLIGATORIO)
 
-Desde el workspace de ROS 2:
+Antes de **entrenar o evaluar**, se debe lanzar el entorno de Stage:
 
-cd ~/ros2_ws
-colcon build --packages-select dqn_stage_nav_torch
-source install/setup.bash
-
----
-
-## 5. Entorno de simulación (REQUERIDO)
-
-Antes de **entrenar o evaluar**, es obligatorio lanzar el entorno de simulación Stage:
-
+```bash
 ros2 launch stage_ros2 demo.launch.py world:=cave use_stamped_velocity:=false
+```
 
 Este entorno proporciona:
-- Mundo tipo cueva
-- LIDAR
-- Odometría
-- Servicios de reset
+- `/base_scan` (LaserScan)
+- `/odom` o `/ground_truth`
+- `/cmd_vel`
+- Servicio `/reset_positions`
 
 ---
 
-## 6. Entrenamiento
+## Estructura del paquete
 
-Una vez lanzado el entorno Stage, el entrenamiento se ejecuta mediante el launch del paquete:
-
-ros2 launch dqn_stage_nav_torch train.launch.py
-
-Este launch inicia:
-- odom_reset_wrapper
-- train_node
-
-Durante el entrenamiento:
-- Se generan checkpoints en la carpeta `models/`
-- Se guarda un archivo CSV con métricas por episodio
-- Se conserva el mejor modelo y el último modelo
-
----
-
-## 7. Evaluación
-
-La evaluación **NO usa launch**.  
-Con el entorno Stage ya en ejecución, se lanzan manualmente los nodos:
-
-1) Ejecutar el wrapper de odometría:
-
-ros2 run dqn_stage_nav_torch odom_reset_wrapper.py
-
-2) Ejecutar el nodo de evaluación:
-
-ros2 run dqn_stage_nav_torch eval_node.py
-
-El nodo de evaluación cargará el modelo entrenado y ejecutará la política aprendida sin modificar los pesos.
+```text
+dqn_stage_nav_torch/
+├── dqn_stage_nav_torch/
+│   ├── __init__.py
+│   ├── torch_dqn_agent.py
+│   ├── state_processor.py
+│   ├── train_node.py
+│   ├── eval_node.py
+│   └── odom_reset_wrapper.py
+├── launch/
+│   └── train.launch.py
+├── resource/
+│   └── dqn_stage_nav_torch
+├── test/
+│   ├── test_flake8.py
+│   ├── test_pep257.py
+│   └── test_copyright.py
+├── package.xml
+├── setup.py
+├── setup.cfg
+└── README.md
+```
 
 ---
 
-## 8. Flujo completo recomendado
+## Descripción de archivos
 
-1) Lanzar Stage:
+### `torch_dqn_agent.py`
+Implementa el agente DQN:
+- Arquitectura **CNN/MLP híbrida**
+- Dueling DQN
+- Double DQN
+- Replay Buffer
+- Soft update del target network
+- Guardado y carga de checkpoints
+
+Clases principales:
+- `TorchDQNConfig`
+- `QNetwork`
+- `ReplayBuffer`
+- `TorchDQNAgent`
+
+---
+
+### `state_processor.py`
+Encargado de:
+- Discretizar el LiDAR en bins
+- Normalizar distancias
+- Construir el vector de estado final
+
+El estado incluye:
+- LiDAR reducido
+- Distancia y ángulo al objetivo
+- Velocidades previas
+- Información de seguridad (distancia mínima a obstáculo)
+
+---
+
+### `odom_reset_wrapper.py`
+Nodo **crítico** para entrenamiento y evaluación.
+
+Funciones:
+- Escucha `/odom`
+- Publica `/odom/sim` con origen reiniciado
+- Permite reiniciar la odometría usando un servicio ROS
+
+Esto evita que la red vea posiciones absolutas inconsistentes entre episodios.
+
+---
+
+### `train_node.py`
+Nodo principal de entrenamiento.
+
+Responsabilidades:
+- Gestión de episodios
+- Curriculum learning (easy → medium → hard)
+- Reward shaping detallado
+- Detección de colisión, estancamiento, timeout
+- Logging a CSV
+- Guardado de modelos
+
+Rewards considerados:
+- Penalización por paso
+- Progreso hacia el objetivo
+- Orientación al objetivo
+- Proximidad a obstáculos
+- Penalización por giro excesivo
+- Bonus cerca del objetivo
+- Penalización por alejarse demasiado
+
+---
+
+### `eval_node.py`
+Nodo de evaluación.
+
+- Usa un modelo entrenado (`.pth`)
+- No entrena ni modifica pesos
+- Ejecuta la política greedy (sin exploración)
+- Permite observar el comportamiento aprendido
+
+---
+
+## Entrenamiento
+
+1. Lanzar el entorno Stage (obligatorio):
+
+```bash
 ros2 launch stage_ros2 demo.launch.py world:=cave use_stamped_velocity:=false
+```
 
-2) Entrenar:
+2. Ejecutar el entrenamiento:
+
+```bash
 ros2 launch dqn_stage_nav_torch train.launch.py
+```
 
-3) Evaluar (en una nueva sesión o tras el entrenamiento):
+El entrenamiento:
+- Guarda checkpoints en `models/`
+- Registra métricas en `training_log.csv`
+- Puede reanudarse automáticamente desde el último checkpoint
+
+---
+
+## Evaluación
+
+Para **evaluar**, NO se usa launch.
+
+Solo se ejecutan los siguientes nodos:
+
+```bash
 ros2 run dqn_stage_nav_torch odom_reset_wrapper.py
 ros2 run dqn_stage_nav_torch eval_node.py
+```
+
+Orden recomendado:
+1. Asegurarse de que Stage esté corriendo
+2. Ejecutar `odom_reset_wrapper.py`
+3. Ejecutar `eval_node.py`
+
+Durante la evaluación:
+- No hay exploración (`epsilon = 0`)
+- El robot sigue estrictamente la política aprendida
+- No se modifican los pesos
 
 ---
 
-## 9. Notas importantes
+## Build del paquete
 
-- El wrapper de odometría es obligatorio
-- El entorno no utiliza mapa global
-- La navegación se basa únicamente en LIDAR + odometría
-- El sistema está diseñado para experimentación académica y extensión futura
+Desde tu workspace:
+
+```bash
+colcon build --packages-select dqn_stage_nav_torch
+source install/setup.bash
+```
 
 ---
 
-## 10. Autor
+## Notas importantes
 
-Proyecto desarrollado con fines académicos para experimentación en aprendizaje por refuerzo aplicado a navegación robótica en ROS 2.
+- El wrapper de odometría es **obligatorio**
+- El entorno debe ser siempre el mismo durante train y eval
+- Cambiar el mundo (`world:=cave`) invalida modelos entrenados
+- Los parámetros de reward están pensados para **Stage + LiDAR 2D**
+- El sistema no usa mapa global ni SLAM
+
+---
+
+## Autor
+
+Proyecto académico / experimental  
+Uso libre para investigación y aprendizaje
