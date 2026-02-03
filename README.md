@@ -52,8 +52,8 @@ dqn_stage_nav_torch/
 │   └── odom_reset_wrapper.py
 ├── launch/
 │   └── train.launch.py
-├── resource/
-│   └── dqn_stage_nav_torch
+├── models/
+│   └── weights...
 ├── test/
 │   ├── test_flake8.py
 │   ├── test_pep257.py
