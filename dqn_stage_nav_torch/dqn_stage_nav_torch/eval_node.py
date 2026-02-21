@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import csv
 import math
 import os
 import time
 import traceback
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 from collections import deque
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -32,12 +34,6 @@ def yaw_from_quaternion(q) -> float:
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(siny_cosp, cosy_cosp)
-
-
-def rot2d(x: float, y: float, yaw: float) -> Tuple[float, float]:
-    c = math.cos(yaw)
-    s = math.sin(yaw)
-    return (c * x - s * y, s * x + c * y)
 
 
 def angle_to_goal(gx: float, gy: float, yaw: float, goalx: float, goaly: float) -> float:
@@ -64,6 +60,57 @@ def build_action_set(v_max: float, w_max: float) -> List[Action]:
     ]
 
 
+# --------------------- Goal CSV Loader ---------------------
+def _try_float(v) -> Optional[float]:
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def load_goals_from_csv(path: str) -> List[Tuple[float, float]]:
+    """Loads goals from a CSV with header. Accepts columns:
+    - x,y
+    - goal_x,goal_y
+    - X,Y
+    Otherwise falls back to first two numeric columns per row.
+    """
+    if not path or (not os.path.exists(path)):
+        return []
+
+    goals: List[Tuple[float, float]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        headers = [h.strip() for h in (reader.fieldnames or [])]
+
+        def pick(row: dict, key: str) -> Optional[float]:
+            if key in row:
+                return _try_float(row[key])
+            return None
+
+        for row in reader:
+            x = pick(row, "x") or pick(row, "X") or pick(row, "goal_x") or pick(row, "gx")
+            y = pick(row, "y") or pick(row, "Y") or pick(row, "goal_y") or pick(row, "gy")
+
+            if x is None or y is None:
+                # fallback: first two numeric fields
+                vals = []
+                for h in headers:
+                    fv = _try_float(row.get(h, None))
+                    if fv is not None:
+                        vals.append(fv)
+                    if len(vals) >= 2:
+                        break
+                if len(vals) >= 2:
+                    x, y = vals[0], vals[1]
+
+            if x is None or y is None:
+                continue
+            goals.append((float(x), float(y)))
+
+    return goals
+
+
 # --------------------- Node ---------------------
 class DQNEvalNode(Node):
     def __init__(self):
@@ -77,24 +124,21 @@ class DQNEvalNode(Node):
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("reset_service", "/reset_sim")
 
-        # Spawn Fallback
-        self.declare_parameter("spawn_global_x", -7.0)
-        self.declare_parameter("spawn_global_y", -7.0)
-        self.declare_parameter("spawn_global_yaw_deg", 45.0)
-
         # Lidar/State
         self.declare_parameter("lidar_bins", 20)
         self.declare_parameter("lidar_max_range", 4.5)
+        self.declare_parameter("lidar_fov_deg", 270.0)
+        self.declare_parameter("front_sector_deg", 30.0)
         self.declare_parameter("max_goal_dist", 15.0)
 
         # Actions/Dynamics
-        self.declare_parameter("v_max", 1.2)
-        self.declare_parameter("w_max", 1.8)
+        self.declare_parameter("v_max", 1.25)
+        self.declare_parameter("w_max", 2.00)
 
         # ---------------- Termination / Timing ----------------
         self.declare_parameter("goal_tolerance_enter", 0.45)
         self.declare_parameter("goal_tolerance_exit", 1.00)
-        self.declare_parameter("goal_hold_steps", 8) 
+        self.declare_parameter("goal_hold_steps", 8)
 
         self.declare_parameter("collision_range", 0.25)
         self.declare_parameter("max_steps", 800)
@@ -102,125 +146,155 @@ class DQNEvalNode(Node):
 
         # ---------------- Evaluation Plan ----------------
         self.declare_parameter("trials_per_goal", 1)
-        self.declare_parameter(
-            "eval_goals_xy",
-            [
-                -2.58, -5.73,  -2.77, -5.55,  -2.55, -4.90,   7.69,  3.27,
-                 5.18, -2.66,   7.82, -3.14,   5.18,  5.75,   4.91, -1.86,
-                 7.04, -2.44,   6.82,  3.49,   7.82,  4.79,   4.11,  5.75,
-                 6.53,  4.93,   6.82,  5.66,   7.64,  5.66,   7.85,  4.79,
-                 7.69,  4.00,   7.85,  3.80,   7.24,  5.08,   6.37,  5.41,
-                 6.68,  5.08,   7.24,  4.93,   6.82,  4.64,   7.24,  3.64,
-                 6.53,  3.49,   7.64,  3.49,   6.18,  3.80,   6.37,  3.64,
-                 5.84, -2.81,   5.73, -3.42,   6.37, -3.14,   7.51, -3.38,
-                 7.69, -3.55,   6.37, -3.64,   7.40, -3.55,   6.82, -3.27,
-                 5.52, -3.38,   5.96, -3.14,   6.18, -3.27,   7.24, -3.27,
-                 6.68, -3.42,   7.04, -3.64,   5.73, -2.97,   6.18, -2.97,
-                 0.43, -5.96,   0.64, -6.11,  -5.89, -6.57,  -6.20, -6.11,
-                -6.05, -6.73,  -5.56, -6.57,  -5.73, -6.11,  -4.94, -6.11,
-                -4.88, -5.96,  -4.72, -6.25,  -4.09, -6.41,  -3.73, -6.11,
-                -3.64, -5.96,  -3.42, -5.96,  -3.27, -6.11,  -5.18, -5.80,
-                -4.39, -5.80,  -4.94, -5.80,  -6.05, -5.80,  -5.56, -5.96,
-            ],
-        )
+
+        # Goal list from CSV
+        self.declare_parameter("goals_csv_path", "")
+        self.declare_parameter("shuffle_goals", False)
+        self.declare_parameter("max_goals", 0)  # 0 = all
+
+        # Legacy fallback (kept for compatibility)
+        self.declare_parameter("eval_goals_xy", [])
 
         # ---------------- Stuck detection ----------------
-        # Far from Goal
         self.declare_parameter("stuck_window_steps_far", 30)
         self.declare_parameter("stuck_move_eps_far", 0.08)
 
-        # Close to Goal
         self.declare_parameter("stuck_window_steps_near", 60)
         self.declare_parameter("stuck_move_eps_near", 0.05)
 
-        # Oscilation
+        # Oscillation
         self.declare_parameter("osc_window_steps", 24)
         self.declare_parameter("osc_allow_only_rot", True)
-        self.declare_parameter("osc_alt_ratio", 0.80) 
-        self.declare_parameter("near_goal_max_steps_without_hold", 160)  
+        self.declare_parameter("osc_alt_ratio", 0.80)
+        self.declare_parameter("near_goal_max_steps_without_hold", 160)
+
+        # Action masking
+        self.declare_parameter("mask_stop_dist", 0.28)
+        self.declare_parameter("mask_slow_dist", 0.48)
 
         # ---------------- Model ----------------
-        self.declare_parameter(
-            "model_path",
-            os.path.expanduser("~/ros2_workspaces/diplomado_ws/src/dqn_stage_nav_torch/models/best_model.pth"),
-        )
-        self.declare_parameter("device", "cuda") 
+        self.declare_parameter("model_path", "")
+        self.declare_parameter("device", "cuda")
 
         # ---------------- Logging/Outputs ----------------
         self.declare_parameter("print_every_steps", 25)
-        self.declare_parameter("results_csv_path", "")  
+        self.declare_parameter("results_csv_path", "")
 
         # ---------------- Read Params ----------------
-        self.scan_topic = str(self.get_parameter("scan_topic").value)
-        self.odom_topic = str(self.get_parameter("odom_topic").value)
-        self.raw_odom_topic = str(self.get_parameter("raw_odom_topic").value)
-        self.use_raw_odom_for_global = bool(self.get_parameter("use_raw_odom_for_global").value)
-        self.cmd_vel_topic = str(self.get_parameter("cmd_vel_topic").value)
-        self.reset_service = str(self.get_parameter("reset_service").value)
+        gp = self.get_parameter
 
-        self.spawn_x_fallback = float(self.get_parameter("spawn_global_x").value)
-        self.spawn_y_fallback = float(self.get_parameter("spawn_global_y").value)
-        self.spawn_yaw_fallback = math.radians(float(self.get_parameter("spawn_global_yaw_deg").value))
+        self.scan_topic = str(gp("scan_topic").value)
+        self.odom_topic = str(gp("odom_topic").value)
+        self.raw_odom_topic = str(gp("raw_odom_topic").value)
+        self.use_raw_odom_for_global = bool(gp("use_raw_odom_for_global").value)
+        self.cmd_vel_topic = str(gp("cmd_vel_topic").value)
+        self.reset_service = str(gp("reset_service").value)
 
-        self.lidar_bins = int(self.get_parameter("lidar_bins").value)
-        self.lidar_max = float(self.get_parameter("lidar_max_range").value)
-        self.max_goal_dist = float(self.get_parameter("max_goal_dist").value)
+        self.lidar_bins = int(gp("lidar_bins").value)
+        self.lidar_max = float(gp("lidar_max_range").value)
+        self.lidar_fov_deg = float(gp("lidar_fov_deg").value)
+        self.front_sector_deg = float(gp("front_sector_deg").value)
+        self.max_goal_dist = float(gp("max_goal_dist").value)
 
-        self.v_max = float(self.get_parameter("v_max").value)
-        self.w_max = float(self.get_parameter("w_max").value)
+        self.v_max = float(gp("v_max").value)
+        self.w_max = float(gp("w_max").value)
 
-        self.goal_tol_enter = float(self.get_parameter("goal_tolerance_enter").value)
-        self.goal_tol_exit = float(self.get_parameter("goal_tolerance_exit").value)
-        self.goal_hold_steps = int(self.get_parameter("goal_hold_steps").value)
+        self.goal_tol_enter = float(gp("goal_tolerance_enter").value)
+        self.goal_tol_exit = float(gp("goal_tolerance_exit").value)
+        self.goal_hold_steps = int(gp("goal_hold_steps").value)
         if self.goal_tol_exit < self.goal_tol_enter:
             self.goal_tol_exit = self.goal_tol_enter
 
-        self.collision_range = float(self.get_parameter("collision_range").value)
-        self.max_steps = int(self.get_parameter("max_steps").value)
-        self.control_dt = float(self.get_parameter("control_dt").value)
+        self.collision_range = float(gp("collision_range").value)
+        self.max_steps = int(gp("max_steps").value)
+        self.control_dt = float(gp("control_dt").value)
 
-        self.trials_per_goal = int(self.get_parameter("trials_per_goal").value)
-        self.eval_goals = self._parse_goals(self.get_parameter("eval_goals_xy").value)
-        if not self.eval_goals:
-            raise RuntimeError("eval_goals_xy is empty or invalid (must be [x1,y1,x2,y2,...]).")
+        self.trials_per_goal = int(gp("trials_per_goal").value)
 
-        self.stuck_window_far = int(self.get_parameter("stuck_window_steps_far").value)
-        self.stuck_eps_far = float(self.get_parameter("stuck_move_eps_far").value)
-        self.stuck_window_near = int(self.get_parameter("stuck_window_steps_near").value)
-        self.stuck_eps_near = float(self.get_parameter("stuck_move_eps_near").value)
+        self.goals_csv_path = os.path.expanduser(str(gp("goals_csv_path").value)).strip()
+        self.shuffle_goals = bool(gp("shuffle_goals").value)
+        self.max_goals = int(gp("max_goals").value)
 
-        self.osc_window_steps = int(self.get_parameter("osc_window_steps").value)
-        self.osc_allow_only_rot = bool(self.get_parameter("osc_allow_only_rot").value)
-        self.osc_alt_ratio = float(self.get_parameter("osc_alt_ratio").value)
-        self.near_goal_max_steps_without_hold = int(self.get_parameter("near_goal_max_steps_without_hold").value)
+        self.stuck_window_far = int(gp("stuck_window_steps_far").value)
+        self.stuck_eps_far = float(gp("stuck_move_eps_far").value)
+        self.stuck_window_near = int(gp("stuck_window_steps_near").value)
+        self.stuck_eps_near = float(gp("stuck_move_eps_near").value)
 
-        self.model_path = os.path.expanduser(str(self.get_parameter("model_path").value))
-        self.device = str(self.get_parameter("device").value).strip()
+        self.osc_window_steps = int(gp("osc_window_steps").value)
+        self.osc_allow_only_rot = bool(gp("osc_allow_only_rot").value)
+        self.osc_alt_ratio = float(gp("osc_alt_ratio").value)
+        self.near_goal_max_steps_without_hold = int(gp("near_goal_max_steps_without_hold").value)
 
-        self.print_every_steps = int(self.get_parameter("print_every_steps").value)
+        self.mask_stop_dist = float(gp("mask_stop_dist").value)
+        self.mask_slow_dist = float(gp("mask_slow_dist").value)
 
-        csv_param = str(self.get_parameter("results_csv_path").value).strip()
+        model_path_param = str(gp("model_path").value).strip()
+        self.device = str(gp("device").value).strip()
+
+        # Paths => Default to ~/.../models/best_model.pth
+        if model_path_param:
+            self.model_path = os.path.expanduser(model_path_param)
+        else:
+            self.model_path = os.path.expanduser("~/ros2_workspaces/diplomado_ws/src/dqn_stage_nav_torch/models/last_model.pth")
+
+        # Goals: Default CSV alongside model (models/distributed_points.csv)
+        if not self.goals_csv_path:
+            model_dir = os.path.dirname(os.path.abspath(self.model_path))
+            self.goals_csv_path = os.path.join(model_dir, "distributed_points.csv")
+
+        self.print_every_steps = int(gp("print_every_steps").value)
+
+        csv_param = str(gp("results_csv_path").value).strip()
         if csv_param:
             self.results_csv_path = os.path.expanduser(csv_param)
         else:
             model_dir = os.path.dirname(os.path.abspath(self.model_path))
-            self.results_csv_path = os.path.join(model_dir, "eval_results.csv")
+            self.results_csv_path = os.path.join(model_dir, "eval_results_last.csv")
+
+        # ---------------- Load goals ----------------
+        goals = load_goals_from_csv(self.goals_csv_path)
+        if not goals:
+            # fallback legacy list
+            goals = self._parse_goals(gp("eval_goals_xy").value)
+
+        if not goals:
+            raise RuntimeError("No evaluation goals loaded (goals_csv_path invalid/empty AND eval_goals_xy empty).")
+
+        if self.shuffle_goals:
+            rng = np.random.default_rng(42)
+            rng.shuffle(goals)
+
+        if self.max_goals > 0:
+            goals = goals[: self.max_goals]
+
+        self.eval_goals: List[Tuple[float, float]] = goals
 
         # ---------------- ROS I/O ----------------
-        self.sub_scan = self.create_subscription(LaserScan, self.scan_topic, self._scan_cb, 10)
-        self.sub_odom_sim = self.create_subscription(Odometry, self.odom_topic, self._odom_sim_cb, 10)
-        self.sub_odom_raw = self.create_subscription(Odometry, self.raw_odom_topic, self._odom_raw_cb, 10)
+        # Sensor QoS: x10/x30 safe
+        sensor_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        )
+        self.sub_scan = self.create_subscription(LaserScan, self.scan_topic, self._scan_cb, sensor_qos)
+        self.sub_odom_sim = self.create_subscription(Odometry, self.odom_topic, self._odom_sim_cb, sensor_qos)
+        self.sub_odom_raw = self.create_subscription(Odometry, self.raw_odom_topic, self._odom_raw_cb, sensor_qos)
+
         self.pub_cmd = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.reset_client = self.create_client(Empty, self.reset_service)
 
         # ---------------- Action Set + Agent/State ----------------
         self.actions = build_action_set(self.v_max, self.w_max)
         self.action_size = len(self.actions)
+        self.idx_rot = np.array([i for i, a in enumerate(self.actions) if a.name.startswith("ROT")], dtype=np.int64)
+        self.idx_fast = np.array([i for i, a in enumerate(self.actions) if a.name == "FWD_F"], dtype=np.int64)
 
         sp_cfg = StateProcessorConfig(
             n_lidar_bins=self.lidar_bins,
             max_goal_dist=self.max_goal_dist,
             range_max_fallback=self.lidar_max,
+            fov_deg=self.lidar_fov_deg,
+            front_sector_deg=self.front_sector_deg,
         )
         self.state_proc = StateProcessor(sp_cfg)
 
@@ -239,17 +313,18 @@ class DQNEvalNode(Node):
         loaded, ep = self.agent.load_checkpoint(self.model_path)
         if not loaded:
             raise RuntimeError(f"Failed to load checkpoint: {self.model_path}")
-        self.agent.epsilon = 0.0 
+        self.agent.epsilon = 0.0
 
-        # ---------------- Latest Messages ----------------
+        # ---------------- Latest Messages + counters ----------------
         self.scan_msg: Optional[LaserScan] = None
         self.odom_sim_msg: Optional[Odometry] = None
         self.odom_raw_msg: Optional[Odometry] = None
-
-        # Spawn Calibration Fallback
-        self.spawn_x = self.spawn_x_fallback
-        self.spawn_y = self.spawn_y_fallback
-        self.spawn_yaw = self.spawn_yaw_fallback
+        self.scan_count = 0
+        self.odom_sim_count = 0
+        self.odom_raw_count = 0
+        self._last_processed_scan_count = 0
+        self._last_processed_odom_sim_count = 0
+        self._last_processed_odom_raw_count = 0
 
         # ---------------- Eval Bookkeeping ----------------
         self.total_episodes = len(self.eval_goals) * self.trials_per_goal
@@ -265,36 +340,44 @@ class DQNEvalNode(Node):
         self.step_idx = 0
         self.prev_v = 0.0
         self.prev_w = 0.0
+
         self.last_min_range = float("inf")
+        self.min_range_min = float("inf")
+        self.front_min_end = float("inf")
+        self.front_min_min = float("inf")
+
         self.last_dist = float("inf")
         self.best_dist = float("inf")
+        self.dist0 = float("inf")
+
+        self.path_len = 0.0
+        self.last_pos: Optional[Tuple[float, float]] = None
+
+        self.abs_w_sum = 0.0
+        self.v_sum = 0.0
+        self.step_count_for_means = 0
 
         # Goal Hold State
         self.goal_hold_count = 0
-        self.near_goal_steps = 0  
+        self.near_goal_steps = 0
+        self.time_to_success_s: Optional[float] = None
 
         # Stuck Trackers
-        self.pos_hist = deque(maxlen=max(2, self.stuck_window_near))
-        self.action_name_hist = deque(maxlen=max(2, self.osc_window_steps))
-        self.action_v_hist = deque(maxlen=max(2, self.osc_window_steps))
+        self.pos_hist: Deque[Tuple[float, float]] = deque(maxlen=max(2, self.stuck_window_near))
+        self.action_name_hist: Deque[str] = deque(maxlen=max(2, self.osc_window_steps))
+        self.action_v_hist: Deque[float] = deque(maxlen=max(2, self.osc_window_steps))
 
         # Results
-        self.results = []
+        self.results: List[dict] = []
         self._init_csv()
 
         # Start
         self.current_goal = self._current_goal()
-        self.get_logger().info(f"Loaded model: {self.model_path} (episode={ep})")
+        self.get_logger().info(f"Loaded model: {self.model_path} (ckpt_ep={ep})")
         self.get_logger().info(
-            f"Eval plan: {len(self.eval_goals)} goals x {self.trials_per_goal} trials = {self.total_episodes} episodes"
+            f"Goals: {len(self.eval_goals)} (from {self.goals_csv_path}) x trials={self.trials_per_goal} => {self.total_episodes} episodes"
         )
         self.get_logger().info(f"Saving results to: {self.results_csv_path}")
-        self.get_logger().info(
-            f"SUCCESS practical: enter={self.goal_tol_enter:.2f} exit={self.goal_tol_exit:.2f} hold_steps={self.goal_hold_steps} "
-            f"| stuck_far: win={self.stuck_window_far} eps={self.stuck_eps_far:.2f} "
-            f"| stuck_near: win={self.stuck_window_near} eps={self.stuck_eps_near:.2f} "
-            f"| osc_win={self.osc_window_steps} alt_ratio={self.osc_alt_ratio:.2f}"
-        )
 
         self._request_reset()
         self.timer = self.create_timer(self.control_dt, self.control_loop)
@@ -303,28 +386,44 @@ class DQNEvalNode(Node):
     def _init_csv(self):
         os.makedirs(os.path.dirname(self.results_csv_path), exist_ok=True)
         if not os.path.exists(self.results_csv_path):
-            with open(self.results_csv_path, "w", encoding="utf-8") as f:
-                f.write(
-                    "episode,goal_idx,trial_idx,goal_x,goal_y,outcome,steps,"
-                    "dist_final,best_dist,success_dist_used,min_range_final,elapsed_s,stuck_reason,stamp\n"
-                )
+            with open(self.results_csv_path, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "episode","goal_idx","trial_idx","goal_x","goal_y",
+                    "success","outcome","steps","elapsed_s","time_to_success_s",
+                    "dist0","dist_final","best_dist","progress_best","ang_final",
+                    "path_len","mean_v","mean_abs_w",
+                    "min_range_end","min_range_min","front_min_end","front_min_min",
+                    "stuck_reason","oscillation_flag",
+                    "model_path","goals_csv_path","stamp",
+                ])
 
     def _append_csv(self, row: dict):
-        with open(self.results_csv_path, "a", encoding="utf-8") as f:
-            f.write(
-                f"{row['episode']},{row['goal_idx']},{row['trial_idx']},"
-                f"{row['goal_x']:.3f},{row['goal_y']:.3f},"
-                f"{row['outcome']},{row['steps']},"
-                f"{row['dist_final']:.3f},{row['best_dist']:.3f},{row['success_dist_used']:.3f},"
-                f"{row['min_range_final']:.3f},{row['elapsed_s']:.3f},"
-                f"{row['stuck_reason']},{row['stamp']}\n"
-            )
+        with open(self.results_csv_path, "a", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                row["episode"], row["goal_idx"], row["trial_idx"], f"{row['goal_x']:.3f}", f"{row['goal_y']:.3f}",
+                int(row["success"]), row["outcome"], row["steps"], f"{row['elapsed_s']:.3f}",
+                "" if row["time_to_success_s"] is None else f"{row['time_to_success_s']:.3f}",
+                f"{row['dist0']:.3f}", f"{row['dist_final']:.3f}", f"{row['best_dist']:.3f}",
+                f"{row['progress_best']:.3f}", f"{row['ang_final']:.3f}",
+                f"{row['path_len']:.3f}", f"{row['mean_v']:.3f}", f"{row['mean_abs_w']:.3f}",
+                f"{row['min_range_end']:.3f}", f"{row['min_range_min']:.3f}",
+                f"{row['front_min_end']:.3f}", f"{row['front_min_min']:.3f}",
+                row["stuck_reason"].replace(",", ";"),
+                int(row["oscillation_flag"]),
+                row["model_path"], row["goals_csv_path"], row["stamp"],
+            ])
 
     # ---------- Goals ----------
     def _parse_goals(self, goals_xy) -> List[Tuple[float, float]]:
         if goals_xy is None or not isinstance(goals_xy, (list, tuple)):
             return []
-        vals = [float(v) for v in goals_xy]
+        vals = []
+        for v in goals_xy:
+            fv = _try_float(v)
+            if fv is not None:
+                vals.append(float(fv))
         if len(vals) < 2:
             return []
         if len(vals) % 2 != 0:
@@ -344,12 +443,15 @@ class DQNEvalNode(Node):
     # ---------- Callbacks ----------
     def _scan_cb(self, msg: LaserScan):
         self.scan_msg = msg
+        self.scan_count += 1
 
     def _odom_sim_cb(self, msg: Odometry):
         self.odom_sim_msg = msg
+        self.odom_sim_count += 1
 
     def _odom_raw_cb(self, msg: Odometry):
         self.odom_raw_msg = msg
+        self.odom_raw_count += 1
 
     # ---------- Pose ----------
     def _pose_from_odom(self, msg: Odometry) -> Tuple[float, float, float]:
@@ -357,18 +459,12 @@ class DQNEvalNode(Node):
         yaw = yaw_from_quaternion(msg.pose.pose.orientation)
         return float(p.x), float(p.y), float(yaw)
 
-    def _pose_sim(self) -> Tuple[float, float, float]:
-        if self.odom_sim_msg is None:
-            return 0.0, 0.0, 0.0
-        return self._pose_from_odom(self.odom_sim_msg)
-
     def _pose_global(self) -> Tuple[float, float, float]:
         if self.use_raw_odom_for_global and self.odom_raw_msg is not None:
             return self._pose_from_odom(self.odom_raw_msg)
-
-        sx, sy, syaw = self._pose_sim()
-        dx, dy = rot2d(sx, sy, self.spawn_yaw)
-        return self.spawn_x + dx, self.spawn_y + dy, wrap_pi(self.spawn_yaw + syaw)
+        if self.odom_sim_msg is None:
+            return 0.0, 0.0, 0.0
+        return self._pose_from_odom(self.odom_sim_msg)
 
     # ---------- cmd ----------
     def _publish_twist(self, v: float, w: float):
@@ -379,17 +475,14 @@ class DQNEvalNode(Node):
 
     # ---------- Stuck Detection ----------
     def _effective_stuck_params(self, dist: float) -> Tuple[int, float]:
-        # Near Goal
         if dist <= self.goal_tol_exit:
             return self.stuck_window_near, self.stuck_eps_near
         return self.stuck_window_far, self.stuck_eps_far
 
     def _is_stuck_by_motion(self, dist: float) -> bool:
         win, eps = self._effective_stuck_params(dist)
-
         if len(self.pos_hist) < win:
             return False
-
         x0, y0 = self.pos_hist[-win]
         x1, y1 = self.pos_hist[-1]
         moved = math.hypot(x1 - x0, y1 - y0)
@@ -418,10 +511,29 @@ class DQNEvalNode(Node):
 
         return alt >= int(self.osc_alt_ratio * (len(names) - 1))
 
+    # ---------- Action masking (eval consistency) ----------
+    def _action_mask(self, front_min: float) -> Optional[List[bool]]:
+        if front_min < self.mask_stop_dist:
+            mask = [False] * self.action_size
+            for i in self.idx_rot.tolist():
+                mask[int(i)] = True
+            return mask
+        if front_min < self.mask_slow_dist and len(self.idx_fast) > 0:
+            mask = [True] * self.action_size
+            mask[int(self.idx_fast[0])] = False
+            return mask
+        return None
+
     # ---------- Episode Finalize ----------
-    def _finalize_episode(self, outcome: str, stuck_reason: str = ""):
+    def _finalize_episode(self, outcome: str, stuck_reason: str = "", oscillation_flag: bool = False, ang_final: float = 0.0):
         elapsed_s = time.monotonic() - self.episode_start_ts
-        success_dist_used = self.goal_tol_exit
+        success = (outcome == "SUCCESS")
+
+        if success and self.time_to_success_s is None:
+            self.time_to_success_s = elapsed_s
+
+        mean_v = (self.v_sum / self.step_count_for_means) if self.step_count_for_means > 0 else 0.0
+        mean_abs_w = (self.abs_w_sum / self.step_count_for_means) if self.step_count_for_means > 0 else 0.0
 
         row = {
             "episode": self.episode_idx,
@@ -429,14 +541,27 @@ class DQNEvalNode(Node):
             "trial_idx": self.trial_idx_for_goal,
             "goal_x": float(self.current_goal[0]),
             "goal_y": float(self.current_goal[1]),
+            "success": bool(success),
             "outcome": outcome,
             "steps": int(self.step_idx),
+            "elapsed_s": float(elapsed_s),
+            "time_to_success_s": self.time_to_success_s,
+            "dist0": float(self.dist0),
             "dist_final": float(self.last_dist),
             "best_dist": float(self.best_dist),
-            "success_dist_used": float(success_dist_used),
-            "min_range_final": float(self.last_min_range),
-            "elapsed_s": float(elapsed_s),
-            "stuck_reason": stuck_reason.replace(",", ";"), 
+            "progress_best": float(self.dist0 - self.best_dist),
+            "ang_final": float(ang_final),
+            "path_len": float(self.path_len),
+            "mean_v": float(mean_v),
+            "mean_abs_w": float(mean_abs_w),
+            "min_range_end": float(self.last_min_range),
+            "min_range_min": float(self.min_range_min),
+            "front_min_end": float(self.front_min_end),
+            "front_min_min": float(self.front_min_min),
+            "stuck_reason": stuck_reason,
+            "oscillation_flag": bool(oscillation_flag),
+            "model_path": self.model_path,
+            "goals_csv_path": self.goals_csv_path,
             "stamp": int(time.time()),
         }
 
@@ -475,15 +600,6 @@ class DQNEvalNode(Node):
             f"COLLISION={col} ({pct(col):.1f}%) | TIMEOUT={tout} ({pct(tout):.1f}%) | STUCK={stk} ({pct(stk):.1f}%)"
         )
 
-        for gi, g in enumerate(self.eval_goals):
-            rows = [r for r in self.results if r["goal_idx"] == gi]
-            if not rows:
-                continue
-            s = sum(1 for r in rows if r["outcome"] == "SUCCESS")
-            self.get_logger().info(
-                f"[GOAL {gi:02d}] goal=({g[0]:.2f},{g[1]:.2f}) trials={len(rows)} success={s} ({100.0*s/len(rows):.1f}%)"
-            )
-
     # ---------- reset ----------
     def _request_reset(self):
         self._publish_twist(0.0, 0.0)
@@ -495,16 +611,34 @@ class DQNEvalNode(Node):
         self.step_idx = 0
         self.prev_v = 0.0
         self.prev_w = 0.0
+
         self.last_min_range = float("inf")
+        self.min_range_min = float("inf")
+        self.front_min_end = float("inf")
+        self.front_min_min = float("inf")
+
         self.last_dist = float("inf")
         self.best_dist = float("inf")
+        self.dist0 = float("inf")
+
+        self.path_len = 0.0
+        self.last_pos = None
+
+        self.abs_w_sum = 0.0
+        self.v_sum = 0.0
+        self.step_count_for_means = 0
 
         self.goal_hold_count = 0
         self.near_goal_steps = 0
+        self.time_to_success_s = None
 
         self.pos_hist.clear()
         self.action_name_hist.clear()
         self.action_v_hist.clear()
+
+        self._last_processed_scan_count = self.scan_count
+        self._last_processed_odom_sim_count = self.odom_sim_count
+        self._last_processed_odom_raw_count = self.odom_raw_count
 
         if self.reset_client.wait_for_service(1.0):
             self.reset_client.call_async(Empty.Request())
@@ -514,6 +648,18 @@ class DQNEvalNode(Node):
             )
         else:
             self.get_logger().warn("[EVAL] Reset service not available (continuing without reset)")
+
+    def _has_new_step_data(self) -> bool:
+        if self.scan_msg is None or self.odom_sim_msg is None:
+            return False
+        if self.scan_count == self._last_processed_scan_count:
+            return False
+        if self.odom_sim_count == self._last_processed_odom_sim_count:
+            return False
+        if self.use_raw_odom_for_global and self.odom_raw_msg is not None:
+            if self.odom_raw_count == self._last_processed_odom_raw_count:
+                return False
+        return True
 
     # ---------- Main Loop ----------
     def control_loop(self):
@@ -527,29 +673,65 @@ class DQNEvalNode(Node):
                     self.get_logger().warn("[EVAL] Reset timeout -> retry")
                     self._request_reset()
                     return
-                if dt > 0.35:
+
+                # Wait for fresh sensor/odom after reset
+                have_fresh = (self.scan_count > self._last_processed_scan_count) and (self.odom_sim_count > self._last_processed_odom_sim_count)
+                if self.use_raw_odom_for_global:
+                    have_fresh = have_fresh and (self.odom_raw_count > self._last_processed_odom_raw_count)
+
+                if have_fresh and dt > 0.25:
                     self.waiting_reset = False
                     gx, gy, _ = self._pose_global()
-                    dist0 = math.hypot(self.current_goal[0] - gx, self.current_goal[1] - gy)
-                    self.get_logger().info(f"[EVAL] START pos=({gx:.2f},{gy:.2f}) dist0={dist0:.2f}")
+                    self.dist0 = math.hypot(self.current_goal[0] - gx, self.current_goal[1] - gy)
+                    self.last_dist = self.dist0
+                    self.best_dist = self.dist0
+                    self.last_pos = (gx, gy)
+                    self.pos_hist.append((gx, gy))
+                    self.get_logger().info(f"[EVAL] START pos=({gx:.2f},{gy:.2f}) dist0={self.dist0:.2f}")
                 return
+
+            if not self._has_new_step_data():
+                return
+
+            self._last_processed_scan_count = self.scan_count
+            self._last_processed_odom_sim_count = self.odom_sim_count
+            self._last_processed_odom_raw_count = self.odom_raw_count
 
             gx, gy, gyaw = self._pose_global()
             self.pos_hist.append((gx, gy))
 
-            ranges = np.array(self.scan_msg.ranges, dtype=np.float32)
-            ranges = np.nan_to_num(ranges, nan=self.lidar_max, posinf=self.lidar_max, neginf=0.0)
+            if self.last_pos is not None:
+                self.path_len += math.hypot(gx - self.last_pos[0], gy - self.last_pos[1])
+            self.last_pos = (gx, gy)
+
+            scan = self.scan_msg
+            ranges = np.asarray(scan.ranges, dtype=np.float32)
+            ranges = np.nan_to_num(ranges, nan=self.lidar_max, posinf=self.lidar_max, neginf=self.lidar_max)
             ranges = np.clip(ranges, 0.0, self.lidar_max)
 
-            lidar_bins_norm, min_range = self.state_proc.bin_lidar_min(ranges.tolist(), self.lidar_max)
+            angle_min = float(getattr(scan, "angle_min", 0.0))
+            angle_max = float(getattr(scan, "angle_max", 0.0))
+
+            lidar_bins_norm, min_range = self.state_proc.bin_lidar_min(ranges.tolist(), self.lidar_max, angle_min=angle_min, angle_max=angle_max)
+            front_min = self.state_proc.compute_front_min(
+                ranges=ranges.tolist(),
+                range_max=self.lidar_max,
+                angle_min=angle_min,
+                angle_max=angle_max,
+                front_sector_deg=self.front_sector_deg,
+            )
+
+            self.last_min_range = float(min_range)
+            self.min_range_min = min(self.min_range_min, float(min_range))
+            self.front_min_end = float(front_min)
+            self.front_min_min = min(self.front_min_min, float(front_min))
 
             dist = math.hypot(self.current_goal[0] - gx, self.current_goal[1] - gy)
             ang_err = angle_to_goal(gx, gy, gyaw, float(self.current_goal[0]), float(self.current_goal[1]))
 
-            self.last_min_range = float(min_range)
             self.last_dist = float(dist)
             if dist < self.best_dist:
-                self.best_dist = dist
+                self.best_dist = float(dist)
 
             # -------- SUCCESS Practical with Hysteresis + Hold --------
             if dist <= self.goal_tol_exit:
@@ -560,12 +742,11 @@ class DQNEvalNode(Node):
                 self.goal_hold_count = 0
 
             if self.goal_hold_count >= self.goal_hold_steps:
+                self.time_to_success_s = time.monotonic() - self.episode_start_ts
                 self.get_logger().info(
-                    f"[EVAL] SUCCESS | ep={self.episode_idx} dist={dist:.2f} "
-                    f"(enter={self.goal_tol_enter:.2f}, exit={self.goal_tol_exit:.2f}, hold={self.goal_hold_steps}) "
-                    f"steps={self.step_idx} best={self.best_dist:.2f}"
+                    f"[EVAL] SUCCESS | ep={self.episode_idx} dist={dist:.2f} steps={self.step_idx} best={self.best_dist:.2f}"
                 )
-                self._finalize_episode("SUCCESS")
+                self._finalize_episode("SUCCESS", ang_final=ang_err)
                 return
 
             # Collision
@@ -573,7 +754,7 @@ class DQNEvalNode(Node):
                 self.get_logger().warn(
                     f"[EVAL] COLLISION | ep={self.episode_idx} minR={min_range:.2f} steps={self.step_idx} best={self.best_dist:.2f}"
                 )
-                self._finalize_episode("COLLISION")
+                self._finalize_episode("COLLISION", ang_final=ang_err)
                 return
 
             # Timeout
@@ -581,7 +762,7 @@ class DQNEvalNode(Node):
                 self.get_logger().warn(
                     f"[EVAL] TIMEOUT | ep={self.episode_idx} dist={dist:.2f} steps={self.step_idx} best={self.best_dist:.2f}"
                 )
-                self._finalize_episode("TIMEOUT")
+                self._finalize_episode("TIMEOUT", ang_final=ang_err)
                 return
 
             # Build State
@@ -599,13 +780,11 @@ class DQNEvalNode(Node):
             )
 
             # Act
-            a_idx = self.agent.act(state, training=False)
+            mask = self._action_mask(front_min)
+            a_idx = self.agent.act(state, training=False, action_mask=mask)
             if not isinstance(a_idx, int):
                 a_idx = int(a_idx)
-            if a_idx < 0:
-                a_idx = 0
-            elif a_idx >= self.action_size:
-                a_idx = self.action_size - 1
+            a_idx = int(np.clip(a_idx, 0, self.action_size - 1))
 
             act = self.actions[a_idx]
             self._publish_twist(act.v, act.w)
@@ -616,32 +795,37 @@ class DQNEvalNode(Node):
             self.action_name_hist.append(act.name)
             self.action_v_hist.append(act.v)
 
+            self.v_sum += abs(act.v)
+            self.abs_w_sum += abs(act.w)
+            self.step_count_for_means += 1
+
             self.step_idx += 1
 
             # -------- STUCK detection --------
             stuck_reason = ""
+            osc_flag = False
             if self._is_stuck_by_oscillation():
                 stuck_reason = "oscillation_rot_only"
+                osc_flag = True
             elif self._is_stuck_by_motion(dist):
                 win, eps = self._effective_stuck_params(dist)
-                stuck_reason = f"no_progress(win={win},eps={eps:.3f})"
+                stuck_reason = f"no_motion(win={win},eps={eps:.3f})"
 
             if not stuck_reason and dist <= self.goal_tol_exit and self.near_goal_steps >= self.near_goal_max_steps_without_hold:
                 stuck_reason = f"near_goal_no_hold(steps={self.near_goal_steps})"
 
             if stuck_reason:
                 self.get_logger().warn(
-                    f"[EVAL] STUCK | ep={self.episode_idx} dist={dist:.2f} steps={self.step_idx} "
-                    f"best={self.best_dist:.2f} reason={stuck_reason}"
+                    f"[EVAL] STUCK | ep={self.episode_idx} dist={dist:.2f} steps={self.step_idx} best={self.best_dist:.2f} reason={stuck_reason}"
                 )
-                self._finalize_episode("STUCK", stuck_reason=stuck_reason)
+                self._finalize_episode("STUCK", stuck_reason=stuck_reason, oscillation_flag=osc_flag, ang_final=ang_err)
                 return
 
             if (self.step_idx % max(1, self.print_every_steps)) == 0:
                 self.get_logger().info(
                     f"[EVAL] ep={self.episode_idx:03d} g={self.goal_idx} t={self.trial_idx_for_goal} step={self.step_idx:04d} "
                     f"pos=({gx:6.2f},{gy:6.2f}) dist={dist:5.2f} best={self.best_dist:5.2f} "
-                    f"ang={ang_err:5.2f} minR={min_range:4.2f} "
+                    f"ang={ang_err:5.2f} minR={min_range:4.2f} front={front_min:4.2f} "
                     f"A={act.name} v={act.v:.2f} w={act.w:.2f} hold={self.goal_hold_count}/{self.goal_hold_steps}"
                 )
 
