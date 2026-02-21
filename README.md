@@ -8,7 +8,7 @@ El objetivo es aprender políticas de navegación basadas en **LiDAR + odometrí
 ## Requisitos
 
 ### Software
-- Ubuntu 22.04 (recomendado)
+- Ubuntu 24.04 (recomendado)
 - ROS 2 Jazzy
 - Python ≥ 3.10
 - PyTorch (CPU o CUDA)
@@ -54,6 +54,7 @@ dqn_stage_nav_torch/
 │   └── train.launch.py
 ├── models/
 │   └── weights...
+│   └── metrics...
 ├── test/
 │   ├── test_flake8.py
 │   ├── test_pep257.py
@@ -166,19 +167,11 @@ El entrenamiento:
 
 ## Evaluación
 
-Para **evaluar**, NO se usa launch.
-
-Solo se ejecutan los siguientes nodos:
+Para **evaluar**, se usa lo siguiente:
 
 ```bash
-ros2 run dqn_stage_nav_torch odom_reset_wrapper.py
-ros2 run dqn_stage_nav_torch eval_node.py
+ros2 launch dqn_stage_nav_torch eval.launch.py
 ```
-
-Orden recomendado:
-1. Asegurarse de que Stage esté corriendo
-2. Ejecutar `odom_reset_wrapper.py`
-3. Ejecutar `eval_node.py`
 
 Durante la evaluación:
 - No hay exploración (`epsilon = 0`)
